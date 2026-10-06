@@ -101,7 +101,7 @@ async fn main() -> anyhow::Result<()> {
 
     if !args.no_player {
         let cfg = PlayerConfig {
-            mpv_path: args.mpv.clone(),
+            mpv_path: find_mpv(&args.mpv),
             offset_ms: args.offset_ms,
             extra_args: args.mpv_args.clone(),
         };
@@ -127,6 +127,22 @@ async fn main() -> anyhow::Result<()> {
         prompt();
     }
     Ok(())
+}
+
+/// Prefers an mpv placed next to this program (handy on Windows, where mpv
+/// is usually unzipped rather than installed), else uses `requested`.
+fn find_mpv(requested: &str) -> String {
+    if requested == "mpv" {
+        let name = if cfg!(windows) { "mpv.exe" } else { "mpv" };
+        let beside = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join(name)))
+            .filter(|p| p.is_file());
+        if let Some(path) = beside {
+            return path.to_string_lossy().into_owned();
+        }
+    }
+    requested.to_string()
 }
 
 fn prompt() {
