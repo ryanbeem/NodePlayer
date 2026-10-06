@@ -48,6 +48,8 @@ Then, on any PC in the playlist (or only the host, for host-only):
 ```
 
 Every PC in the playlist opens an mpv window and plays the movie together.
+Pausing, seeking or dropping a file in any mpv window does the same on every
+PC in the playlist.
 A file added on one PC is streamed from that PC to the others, so it does
 not need to be copied first. URLs (`http://…`) and network share paths work
 too. Several playlists can run on the same network at once.
@@ -109,8 +111,6 @@ files with range requests, and hand over leadership when the leader leaves.
 ## Known limits
 
 - Command-line interface only; a desktop UI comes next.
-- Dropping a file onto the mpv window plays it on that PC only; use `add`
-  (it takes a file, a folder or a URL).
 - No pairing or encryption yet: any NodePlayer on the network can join.
 - Sync depends on mpv reporting output latency correctly. Bluetooth speakers
   usually need `--offset-ms`.

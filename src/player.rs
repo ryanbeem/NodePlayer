@@ -19,6 +19,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::clock::SharedClock;
 use crate::media::SharedFiles;
 use crate::node::View;
+use crate::protocol::Command as NodeCommand;
 use crate::timeline::Timeline;
 
 const TICK: Duration = Duration::from_millis(100);
@@ -38,6 +39,9 @@ const CUE_LEAD_US: i64 = 300_000;
 const CUE_WINDOW_US: i64 = 120_000;
 /// Ignore position readings for this long after starting playback.
 const SETTLE_US: i64 = 400_000;
+/// After the user acts in the mpv window, leave mpv alone this long so the
+/// session can catch up instead of the player undoing it.
+const USER_HOLD: Duration = Duration::from_millis(1500);
 /// A paused player further than this from the timeline seeks.
 const PAUSED_TOLERANCE_US: i64 = 40_000;
 
@@ -255,6 +259,18 @@ async fn open_ipc(path: &str) -> std::io::Result<IpcHalves> {
     Ok((Box::new(r), Box::new(w)))
 }
 
+/// What the player tells the rest of the app.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PlayerEvent {
+    /// An item played to its end.
+    Ended(String),
+    /// The user paused, resumed or seeked in the mpv window; apply it to
+    /// the whole session.
+    Command(NodeCommand),
+    /// The user dropped a file or URL onto the mpv window.
+    Dropped(String),
+}
+
 /// Drives one mpv instance from the node's view until mpv exits.
 pub struct Player {
     mpv: Mpv,
@@ -277,6 +293,13 @@ pub struct Player {
     settle_until: i64,
     last_timeline: Option<Timeline>,
     warned_unresolved: Option<String>,
+    /// Seeks and loads we asked for that mpv has not reported yet, so the
+    /// ones it reports beyond these came from the user.
+    our_seeks: u32,
+    our_loads: u32,
+    user_seeking: bool,
+    user_loading: bool,
+    hold_until: Option<std::time::Instant>,
 }
 
 impl Player {
@@ -306,31 +329,23 @@ impl Player {
             settle_until: 0,
             last_timeline: None,
             warned_unresolved: None,
+            our_seeks: 0,
+            our_loads: 0,
+            user_seeking: false,
+            user_loading: false,
+            hold_until: None,
         })
     }
 
-    /// Runs until mpv exits. `ended` is called with the id of each item that
-    /// plays to its end.
-    pub async fn run(mut self, ended: impl Fn(String)) -> anyhow::Result<()> {
+    /// Runs until mpv exits, reporting what happens through `on_event`.
+    pub async fn run(mut self, on_event: impl Fn(PlayerEvent)) -> anyhow::Result<()> {
         let mut tick = tokio::time::interval(TICK);
         loop {
             tokio::select! {
                 event = self.mpv.events.recv() => {
                     let Some(event) = event else { return Ok(()) };
-                    match event.get("event").and_then(Value::as_str) {
-                        Some("file-loaded") => self.ready = true,
-                        Some("end-file") => {
-                            let eof = event.get("reason").and_then(Value::as_str) == Some("eof");
-                            if eof
-                                && let Some(id) = self.loaded.take() {
-                                    let tl = self.view.borrow().state.timeline.clone();
-                                    self.finished = Some((id.clone(), tl));
-                                    self.ready = false;
-                                    ended(id);
-                                }
-                        }
-                        Some("shutdown") => return Ok(()),
-                        _ => {}
+                    if !self.on_mpv_event(&event, &on_event).await {
+                        return Ok(());
                     }
                 }
                 _ = tick.tick() => {
@@ -342,7 +357,102 @@ impl Player {
         }
     }
 
+    /// Handles one mpv event. Returns false once mpv is shutting down.
+    async fn on_mpv_event(&mut self, event: &Value, on_event: &impl Fn(PlayerEvent)) -> bool {
+        match event.get("event").and_then(Value::as_str) {
+            Some("start-file") => {
+                if self.our_loads > 0 {
+                    self.our_loads -= 1;
+                } else {
+                    self.user_loading = true;
+                    self.hold();
+                }
+            }
+            Some("file-loaded") => {
+                if self.user_loading {
+                    self.user_loading = false;
+                    self.loaded = None;
+                    self.ready = false;
+                    if let Ok(Value::String(path)) =
+                        self.mpv.command(json!(["get_property", "path"])).await
+                    {
+                        on_event(PlayerEvent::Dropped(path));
+                    }
+                    self.hold();
+                } else {
+                    self.ready = true;
+                }
+            }
+            Some("end-file") => {
+                let eof = event.get("reason").and_then(Value::as_str) == Some("eof");
+                if eof && let Some(id) = self.loaded.take() {
+                    let tl = self.view.borrow().state.timeline.clone();
+                    self.finished = Some((id.clone(), tl));
+                    self.ready = false;
+                    on_event(PlayerEvent::Ended(id));
+                }
+            }
+            Some("property-change")
+                if event.get("name").and_then(Value::as_str) == Some("pause") =>
+            {
+                let Some(paused) = event.get("data").and_then(Value::as_bool) else {
+                    return true;
+                };
+                // Our own changes already updated `self.paused`.
+                if paused != self.paused && self.loaded.is_some() {
+                    self.paused = paused;
+                    self.cue = None;
+                    self.hold();
+                    let command = if paused {
+                        NodeCommand::Pause
+                    } else {
+                        NodeCommand::Resume
+                    };
+                    on_event(PlayerEvent::Command(command));
+                }
+            }
+            Some("seek") => {
+                if self.our_seeks > 0 {
+                    self.our_seeks -= 1;
+                } else if self.loaded.is_some() {
+                    self.user_seeking = true;
+                    self.hold();
+                }
+            }
+            Some("playback-restart") if self.user_seeking => {
+                self.user_seeking = false;
+                if let Some(pos) = self.mpv.get_f64("time-pos").await {
+                    let pos_ms = ((pos * 1e6) as i64 - self.offset_us) / 1000;
+                    on_event(PlayerEvent::Command(NodeCommand::Seek { pos_ms }));
+                }
+                self.hold();
+            }
+            Some("shutdown") => return false,
+            _ => {}
+        }
+        true
+    }
+
+    fn hold(&mut self) {
+        self.hold_until = Some(std::time::Instant::now() + USER_HOLD);
+    }
+
+    async fn seek(&mut self, pos_us: i64) -> anyhow::Result<()> {
+        self.our_seeks += 1;
+        let result = self.mpv.seek_us(pos_us).await;
+        if result.is_err() {
+            self.our_seeks -= 1;
+        }
+        result
+    }
+
     async fn step(&mut self) -> anyhow::Result<()> {
+        if self
+            .hold_until
+            .is_some_and(|t| std::time::Instant::now() < t)
+        {
+            return Ok(());
+        }
         let view = self.view.borrow().clone();
         let tl = view.state.timeline.clone();
 
@@ -374,6 +484,7 @@ impl Player {
                 return Ok(());
             };
             tracing::info!("loading {}", item.title);
+            self.our_loads += 1;
             self.mpv
                 .command(json!(["loadfile", url, "replace"]))
                 .await?;
@@ -405,7 +516,7 @@ impl Player {
             if let Some(pos) = self.mpv.position_us().await
                 && (pos - target).abs() > PAUSED_TOLERANCE_US
             {
-                self.mpv.seek_us(target).await?;
+                self.seek(target).await?;
             }
             return Ok(());
         }
@@ -469,7 +580,7 @@ impl Player {
         self.set_paused(true).await?;
         self.set_speed(self.last_timeline.as_ref().map_or(1.0, |t| t.rate))
             .await?;
-        self.mpv.seek_us(cue).await?;
+        self.seek(cue).await?;
         self.cue = Some(cue);
         Ok(())
     }

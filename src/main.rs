@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 
 use clap::Parser;
 use nodeplayer::node::{Config, Node, View};
-use nodeplayer::player::{Player, PlayerConfig};
+use nodeplayer::player::{Player, PlayerConfig, PlayerEvent};
 use nodeplayer::protocol::{Command, EditPolicy};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -99,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    let (player_tx, mut player_rx) = tokio::sync::mpsc::unbounded_channel();
     if !args.no_player {
         let cfg = PlayerConfig {
             mpv_path: find_mpv(&args.mpv),
@@ -107,24 +108,52 @@ async fn main() -> anyhow::Result<()> {
         };
         let player =
             Player::start(&cfg, node.clock.clone(), node.files.clone(), node.view()).await?;
-        let report_ended = node.ended_reporter();
         tokio::spawn(async move {
-            if let Err(e) = player.run(report_ended).await {
+            let result = player.run(move |event| {
+                let _ = player_tx.send(event);
+            });
+            if let Err(e) = result.await {
                 eprintln!("player stopped: {e}");
             }
         });
     }
+    let report_ended = node.ended_reporter();
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     prompt();
-    while let Some(line) = lines.next_line().await? {
-        let view = node.view().borrow().clone();
-        match run_command(&node, &view, line.trim()) {
-            Ok(true) => break,
-            Ok(false) => {}
-            Err(e) => println!("{e}"),
+    loop {
+        tokio::select! {
+            line = lines.next_line() => {
+                let Some(line) = line? else { break };
+                let view = node.view().borrow().clone();
+                match run_command(&node, &view, line.trim()) {
+                    Ok(true) => break,
+                    Ok(false) => {}
+                    Err(e) => println!("{e}"),
+                }
+                prompt();
+            }
+            Some(event) = player_rx.recv() => match event {
+                PlayerEvent::Ended(id) => report_ended(id),
+                PlayerEvent::Command(command) => node.command(command),
+                PlayerEvent::Dropped(path) => {
+                    let view = node.view().borrow().clone();
+                    if view.session().is_none() {
+                        println!("join or create a playlist first; the dropped file plays only here");
+                    } else if !view.can_edit() {
+                        println!("only the host can change this playlist");
+                    } else {
+                        match node.add(&path) {
+                            Ok(item) => {
+                                println!("added {}", item.title);
+                                node.command(Command::Play { item_id: Some(item.id) });
+                            }
+                            Err(e) => println!("{e}"),
+                        }
+                    }
+                }
+            },
         }
-        prompt();
     }
     Ok(())
 }
