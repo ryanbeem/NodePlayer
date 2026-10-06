@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use clap::Parser;
 use nodeplayer::node::{Config, Node, View};
 use nodeplayer::player::{Player, PlayerConfig};
-use nodeplayer::protocol::Command;
+use nodeplayer::protocol::{Command, EditPolicy};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 /// Plays media in sync across PCs on the same network.
@@ -40,7 +40,15 @@ struct Args {
 }
 
 const HELP: &str = "\
-commands:
+playlists:
+  sessions            show playlists on the network
+  create <name> [host-only]
+                      start a playlist that others can join; with host-only,
+                      only this PC can change the playlist
+  join <n or name>    join a playlist from the sessions list
+  leave               leave the playlist
+  edits all|host      host only: who may change the playlist
+playback (in a playlist):
   add <file or URL>   add to the shared playlist
   list                show the playlist
   play [n]            play item n (1-based), or resume / start
@@ -50,8 +58,8 @@ commands:
   remove <n>          remove item n
   move <n> <m>        move item n to position m
   stop                stop playback
-  peers               show nodes on the network
-  status              show what is playing
+  peers               show PCs on the network
+  status              show the playlist and what is playing
   quit";
 
 #[tokio::main]
@@ -75,9 +83,19 @@ async fn main() -> anyhow::Result<()> {
     })
     .await?;
     println!(
-        "NodePlayer \"{}\" is on the network (control port {}). Type help for commands.",
+        "NodePlayer \"{}\" is on the network (control port {}).",
         node.info.name, node.info.control_port
     );
+    println!(
+        "Type sessions to see playlists, join <n> to join one, create <name> to start one, or help."
+    );
+
+    let mut notices = node.notices();
+    tokio::spawn(async move {
+        while let Ok(text) = notices.recv().await {
+            println!("{text}");
+        }
+    });
 
     if !args.no_player {
         let cfg = PlayerConfig {
@@ -145,7 +163,67 @@ fn run_command(node: &Node, view: &View, line: &str) -> anyhow::Result<bool> {
         "" => {}
         "help" | "?" => println!("{HELP}"),
         "quit" | "exit" => return Ok(true),
+        "sessions" => {
+            let sessions = view.sessions();
+            if sessions.is_empty() {
+                println!("no playlists on the network yet; start one with create <name>");
+            }
+            let current = view.session().map(|s| s.id.as_str());
+            for (i, s) in sessions.iter().enumerate() {
+                let mark = if Some(s.id.as_str()) == current {
+                    ">"
+                } else {
+                    " "
+                };
+                let pcs = if s.members == 1 { "PC" } else { "PCs" };
+                println!(
+                    "{mark} {:>2}. {}  (host {}, {} {pcs})",
+                    i + 1,
+                    s.name,
+                    s.host_name,
+                    s.members
+                );
+            }
+        }
+        "create" | "new" => {
+            let (name, policy) = match rest.strip_suffix("host-only") {
+                Some(name) => (name.trim(), EditPolicy::HostOnly),
+                None => (rest, EditPolicy::Anyone),
+            };
+            anyhow::ensure!(!name.is_empty(), "usage: create <name> [host-only]");
+            node.create(name, policy);
+            let who = match policy {
+                EditPolicy::Anyone => "any PC that joins can change it",
+                EditPolicy::HostOnly => "only this PC can change it",
+            };
+            println!("created playlist {name}; {who}");
+        }
+        "join" => {
+            let sessions = view.sessions();
+            let found = match rest.parse::<usize>() {
+                Ok(n) => sessions.get(n.wrapping_sub(1)),
+                Err(_) => sessions.iter().find(|s| s.name.eq_ignore_ascii_case(rest)),
+            };
+            let s = found
+                .ok_or_else(|| anyhow::anyhow!("no playlist {rest}; type sessions to list them"))?;
+            node.join(&s.id);
+            println!("joining {} (host {})", s.name, s.host_name);
+        }
+        "leave" => node.leave(),
+        "edits" => {
+            let policy = match rest {
+                "all" | "anyone" => EditPolicy::Anyone,
+                "host" | "host-only" => EditPolicy::HostOnly,
+                _ => anyhow::bail!("usage: edits all|host"),
+            };
+            anyhow::ensure!(view.is_host(), "only the host can change who may edit");
+            node.command(Command::SetEditPolicy { policy });
+        }
+        "add" | "remove" | "rm" | "move" | "mv" if view.session().is_some() && !view.can_edit() => {
+            anyhow::bail!("only the host can change this playlist")
+        }
         "add" => {
+            anyhow::ensure!(view.session().is_some(), "join or create a playlist first");
             let item = node.add(rest)?;
             println!("added {}", item.title);
         }
@@ -200,38 +278,58 @@ fn run_command(node: &Node, view: &View, line: &str) -> anyhow::Result<bool> {
             });
         }
         "peers" => {
-            let role = |id: &str| if id == view.leader { " (leader)" } else { "" };
-            println!("this node: {}{}", view.me.name, role(&view.me.id));
+            let describe = |p: &nodeplayer::protocol::NodeInfo| match &p.session {
+                Some(s) if s.host == p.id => format!("hosting {}", s.name),
+                Some(s) => format!("in {}", s.name),
+                None => "not in a playlist".to_string(),
+            };
+            println!("this PC: {} ({})", view.me.name, describe(&view.me));
             for p in &view.peers {
-                println!("  {} at {}{}", p.name, p.host, role(&p.id));
+                println!("  {} at {} ({})", p.name, p.host, describe(p));
             }
         }
         "status" => {
+            let Some(session) = view.session() else {
+                println!("not in a playlist; type sessions, join <n> or create <name>");
+                return Ok(false);
+            };
+            let editors = match view.state.edit_policy {
+                EditPolicy::Anyone => "anyone can edit",
+                EditPolicy::HostOnly => "only the host can edit",
+            };
+            println!(
+                "playlist {} (host {}, {editors})",
+                session.name,
+                view.leader_name()
+            );
             let tl = &view.state.timeline;
-            let title = tl
+            match tl
                 .item_id
                 .as_deref()
                 .and_then(|id| view.state.playlist.get(id))
-                .map_or("nothing", |i| i.title.as_str());
-            let pos = node
-                .clock
-                .now_us()
-                .map(|now| tl.position_at(now).max(0) / 1_000_000);
-            let state = if tl.playing { "playing" } else { "paused" };
-            match (tl.item_id.is_some(), pos) {
-                (true, Some(p)) => println!("{state} {title} at {}:{:02}", p / 60, p % 60),
-                _ => println!("playing {title}"),
+            {
+                None => println!("nothing playing"),
+                Some(item) => {
+                    let state = if tl.playing { "playing" } else { "paused" };
+                    match node.clock.now_in_epoch(view.clock_epoch) {
+                        Some(now) => {
+                            let p = tl.position_at(now).max(0) / 1_000_000;
+                            println!("{state} {} at {}:{:02}", item.title, p / 60, p % 60);
+                        }
+                        None => println!("{state} {}", item.title),
+                    }
+                }
             }
-            let sync = match node.clock.best_sample() {
-                _ if view.is_leader() => "this node is the leader".to_string(),
-                Some(s) => format!(
-                    "clock synced to {} (round trip {:.1} ms)",
-                    view.leader_name(),
-                    s.rtt_us as f64 / 1000.0
-                ),
-                None => format!("waiting to sync with {}", view.leader_name()),
-            };
-            println!("{sync}");
+            if !view.is_leader() {
+                match node.clock.best_sample() {
+                    Some(s) => println!(
+                        "clock synced to {} (round trip {:.1} ms)",
+                        view.leader_name(),
+                        s.rtt_us as f64 / 1000.0
+                    ),
+                    None => println!("waiting to sync with {}", view.leader_name()),
+                }
+            }
         }
         other => println!("unknown command {other}; type help"),
     }

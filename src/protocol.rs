@@ -23,9 +23,35 @@ pub struct NodeInfo {
     pub control_port: u16,
     pub clock_port: u16,
     pub media_port: u16,
+    /// The playlist session this node has joined, if any.
+    #[serde(default)]
+    pub session: Option<SessionInfo>,
+}
+
+/// A named playlist session that nodes create and join.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionInfo {
+    pub id: String,
+    pub name: String,
+    /// Node currently hosting the session: it holds the playlist and clock.
+    pub host: String,
+}
+
+/// Who may change a session's playlist. Playback controls (play, pause,
+/// seek, skip) are open to every member either way.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EditPolicy {
+    #[default]
+    Anyone,
+    HostOnly,
 }
 
 impl NodeInfo {
+    pub fn in_session(&self, session_id: &str) -> bool {
+        self.session.as_ref().is_some_and(|s| s.id == session_id)
+    }
+
     fn ip(&self) -> Option<IpAddr> {
         self.host.parse().ok()
     }
@@ -78,12 +104,29 @@ pub enum Command {
     Next,
     Prev,
     Stop,
+    /// Host only: change who may edit the playlist.
+    SetEditPolicy {
+        policy: EditPolicy,
+    },
+}
+
+impl Command {
+    /// Commands that change the playlist, which `EditPolicy` restricts.
+    pub fn edits_playlist(&self) -> bool {
+        matches!(
+            self,
+            Command::Add { .. } | Command::Remove { .. } | Command::Move { .. }
+        )
+    }
 }
 
 /// Everything followers mirror from the leader.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SharedState {
+    /// The host's node id.
     pub leader: String,
+    pub session: Option<SessionInfo>,
+    pub edit_policy: EditPolicy,
     pub version: u64,
     pub playlist: Playlist,
     pub timeline: Timeline,
@@ -106,6 +149,10 @@ pub enum Message {
     State { state: SharedState },
     /// A node's player reached the end of an item.
     Ended { item_id: String },
+    /// A node's details changed (it joined or left a session).
+    Announce { info: NodeInfo },
+    /// Something the user should see, such as a refused command.
+    Notice { text: String },
 }
 
 pub async fn write_message<W: AsyncWriteExt + Unpin>(
@@ -167,6 +214,7 @@ mod tests {
             control_port: 0,
             clock_port: 0,
             media_port: 0,
+            session: None,
         };
         assert!(mk("z", 1).seniority() < mk("a", 2).seniority());
         assert!(mk("a", 1).seniority() < mk("b", 1).seniority());

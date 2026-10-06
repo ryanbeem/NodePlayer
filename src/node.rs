@@ -1,5 +1,10 @@
-//! A running NodePlayer node: control links to other nodes, leader election,
-//! and the shared playlist and timeline.
+//! A running NodePlayer node: control links to other nodes, playlist
+//! sessions, host hand-off, and the shared playlist and timeline.
+//!
+//! A node starts out idle. It can create a named playlist session, which it
+//! then hosts, or join one that another node advertises. The host holds the
+//! playlist, the timeline and the clock every member follows. If the host
+//! leaves, the longest-running remaining member takes over.
 //!
 //! All state lives in one actor task that handles events one at a time, so
 //! there is no locking around the playlist or timeline.
@@ -12,19 +17,21 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::AbortHandle;
 
 use crate::clock::{self, LocalClock, SharedClock};
 use crate::discovery::{self, Discovery};
 use crate::media::{self, SharedFiles};
 use crate::playlist::{Item, Source};
-use crate::protocol::{Command, Message, MessageReader, NodeInfo, SharedState, write_message};
+use crate::protocol::{
+    Command, EditPolicy, Message, MessageReader, NodeInfo, SessionInfo, SharedState, write_message,
+};
 
-/// The leader re-sends its state this often, which doubles as a heartbeat.
-/// Followers also use this tick to retry reaching the leader.
+/// The host re-sends its state this often, which doubles as a heartbeat.
+/// Members also use this tick to retry reaching the host.
 const HEARTBEAT: Duration = Duration::from_secs(2);
-/// A follower that hears nothing from its leader for this long drops it.
+/// A member that hears nothing from its host for this long drops it.
 const LEADER_TIMEOUT: Duration = Duration::from_secs(7);
 
 pub struct Config {
@@ -38,7 +45,7 @@ pub struct Config {
     /// How far ahead play, resume and seek are scheduled so every node can
     /// get ready in time.
     pub start_delay: Duration,
-    /// Overrides the start time used for leader election (tests).
+    /// Overrides the start time used to pick a new host (tests).
     pub started_ms: Option<u64>,
 }
 
@@ -56,33 +63,79 @@ impl Default for Config {
     }
 }
 
+/// A playlist session some node on the network advertises.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionSummary {
+    pub id: String,
+    pub name: String,
+    pub host_name: String,
+    pub members: usize,
+}
+
 /// A snapshot of what this node knows, for the UI and the player.
 #[derive(Clone, Debug)]
 pub struct View {
     pub me: NodeInfo,
+    /// Host of the session this node is in (this node itself when idle).
     pub leader: String,
     pub peers: Vec<NodeInfo>,
     pub state: SharedState,
-    /// True when this node leads, or follows with a live link to the leader.
+    /// True when this node hosts, or is a member with a live link to the host.
     pub connected: bool,
     /// Clock epoch the timeline is expressed in (see `SharedClock::now_in_epoch`).
     pub clock_epoch: u64,
 }
 
 impl View {
+    pub fn session(&self) -> Option<&SessionInfo> {
+        self.me.session.as_ref()
+    }
+
     pub fn is_leader(&self) -> bool {
         self.leader == self.me.id
     }
 
-    pub fn leader_name(&self) -> String {
-        if self.is_leader() {
+    pub fn is_host(&self) -> bool {
+        self.session().is_some() && self.is_leader()
+    }
+
+    pub fn name_of(&self, id: &str) -> String {
+        if id == self.me.id {
             return self.me.name.clone();
         }
         self.peers
             .iter()
-            .find(|p| p.id == self.leader)
+            .find(|p| p.id == id)
             .map(|p| p.name.clone())
-            .unwrap_or_else(|| self.leader.clone())
+            .unwrap_or_else(|| id.chars().take(8).collect())
+    }
+
+    pub fn leader_name(&self) -> String {
+        self.name_of(&self.leader)
+    }
+
+    /// Whether this node may change the playlist.
+    pub fn can_edit(&self) -> bool {
+        self.state.edit_policy == EditPolicy::Anyone || self.is_leader()
+    }
+
+    /// Sessions advertised on the network, including this node's own.
+    pub fn sessions(&self) -> Vec<SessionSummary> {
+        let mut out: Vec<SessionSummary> = Vec::new();
+        for node in self.peers.iter().chain(std::iter::once(&self.me)) {
+            let Some(s) = &node.session else { continue };
+            match out.iter_mut().find(|o| o.id == s.id) {
+                Some(o) => o.members += 1,
+                None => out.push(SessionSummary {
+                    id: s.id.clone(),
+                    name: s.name.clone(),
+                    host_name: self.name_of(&s.host),
+                    members: 1,
+                }),
+            }
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+        out
     }
 
     /// Where this node's player should open `item` from.
@@ -103,6 +156,9 @@ impl View {
 
 enum Event {
     Command(Command),
+    Create { name: String, policy: EditPolicy },
+    Join { session_id: String },
+    Leave,
     Ended(String),
     Discovery(Discovery),
     Connected(TcpStream, SocketAddr),
@@ -118,6 +174,7 @@ pub struct Node {
     pub files: SharedFiles,
     events: mpsc::UnboundedSender<Event>,
     view: watch::Receiver<View>,
+    notices: broadcast::Sender<String>,
     tasks: Vec<AbortHandle>,
     _mdns: Option<mdns_sd::ServiceDaemon>,
 }
@@ -154,10 +211,13 @@ impl Node {
             control_port: control.local_addr()?.port(),
             clock_port: udp.local_addr()?.port(),
             media_port: media_listener.local_addr()?.port(),
+            session: None,
         };
 
         let (events, rx) = mpsc::unbounded_channel();
         let (clock_target, clock_target_rx) = watch::channel(None);
+        let (advert, advert_rx) = watch::channel(me.clone());
+        let (notices, _) = broadcast::channel(32);
         let state = SharedState {
             leader: me.id.clone(),
             ..Default::default()
@@ -208,7 +268,7 @@ impl Node {
 
         let mdns = if cfg.mdns {
             let (dtx, mut drx) = mpsc::unbounded_channel();
-            let daemon = discovery::start(&me, dtx).context("starting mDNS")?;
+            let daemon = discovery::start(advert_rx, dtx).context("starting mDNS")?;
             let fwd = events.clone();
             tasks.push(
                 tokio::spawn(async move {
@@ -240,7 +300,9 @@ impl Node {
             static_peers: cfg.peers.iter().copied().collect(),
             events: events.clone(),
             clock_target,
+            advert,
             view: view_tx,
+            notices: notices.clone(),
         };
         for addr in &cfg.peers {
             actor.dial(*addr);
@@ -253,6 +315,7 @@ impl Node {
             files,
             events,
             view,
+            notices,
             tasks,
             _mdns: mdns,
         })
@@ -262,8 +325,32 @@ impl Node {
         self.view.clone()
     }
 
+    /// Messages for the user, such as a command the host refused.
+    pub fn notices(&self) -> broadcast::Receiver<String> {
+        self.notices.subscribe()
+    }
+
     pub fn command(&self, command: Command) {
         let _ = self.events.send(Event::Command(command));
+    }
+
+    /// Start a new playlist session hosted by this node, leaving any other.
+    pub fn create(&self, name: &str, policy: EditPolicy) {
+        let _ = self.events.send(Event::Create {
+            name: name.to_string(),
+            policy,
+        });
+    }
+
+    /// Join a session another node advertises (see `View::sessions`).
+    pub fn join(&self, session_id: &str) {
+        let _ = self.events.send(Event::Join {
+            session_id: session_id.to_string(),
+        });
+    }
+
+    pub fn leave(&self) {
+        let _ = self.events.send(Event::Leave);
     }
 
     /// Adds a local file (shared from this node) or a URL to the playlist.
@@ -345,22 +432,26 @@ impl Drop for Conn {
 }
 
 struct Actor {
+    /// This node's details, including the session it is in.
     me: NodeInfo,
     start_delay_us: i64,
     clock: Arc<SharedClock>,
     peers: HashMap<String, NodeInfo>,
+    /// Host of our session, or our own id when idle.
     leader: String,
     state: SharedState,
     conns: HashMap<u64, Conn>,
     next_conn: u64,
-    /// Connection to the leader, when following.
+    /// Connection to the host, when we are a member.
     upstream: Option<u64>,
     last_from_leader: Instant,
     dialing: HashSet<SocketAddr>,
     static_peers: HashSet<SocketAddr>,
     events: mpsc::UnboundedSender<Event>,
     clock_target: watch::Sender<Option<SocketAddr>>,
+    advert: watch::Sender<NodeInfo>,
     view: watch::Sender<View>,
+    notices: broadcast::Sender<String>,
 }
 
 impl Actor {
@@ -374,13 +465,36 @@ impl Actor {
         self.leader == self.me.id
     }
 
+    fn session_id(&self) -> Option<&str> {
+        self.me.session.as_ref().map(|s| s.id.as_str())
+    }
+
+    fn notice(&self, text: impl Into<String>) {
+        let _ = self.notices.send(text.into());
+    }
+
     fn handle(&mut self, event: Event) {
         match event {
             Event::Command(command) => {
-                if self.is_leader() {
-                    self.apply(command);
+                if self.me.session.is_none() {
+                    self.notice("Join or create a playlist first (type sessions, join or create).");
+                } else if self.is_leader() {
+                    let me = self.me.id.clone();
+                    if let Err(e) = self.apply(command, &me) {
+                        self.notice(e);
+                    }
+                } else if command.edits_playlist() && self.state.edit_policy == EditPolicy::HostOnly
+                {
+                    self.notice("Only the host can change this playlist.");
                 } else if !self.send_upstream(Message::Request { command }) {
-                    tracing::warn!("not connected to the leader yet; command dropped");
+                    self.notice("Not connected to the host yet; try again in a moment.");
+                }
+            }
+            Event::Create { name, policy } => self.create(name, policy),
+            Event::Join { session_id } => self.join(&session_id),
+            Event::Leave => {
+                if self.me.session.is_some() {
+                    self.leave();
                 }
             }
             Event::Ended(item_id) => {
@@ -392,7 +506,9 @@ impl Actor {
             }
             Event::Discovery(Discovery::Found(info)) => {
                 if self.peers.get(&info.id) != Some(&info) {
-                    tracing::info!("found {} at {}", info.name, info.host);
+                    if !self.peers.contains_key(&info.id) {
+                        tracing::info!("found {} at {}", info.name, info.host);
+                    }
                     self.peers.insert(info.id.clone(), info);
                     self.elect();
                 }
@@ -428,12 +544,82 @@ impl Actor {
         }
     }
 
+    /// Leave any session and become an idle node.
+    fn leave(&mut self) {
+        self.me.session = None;
+        self.become_idle();
+        self.announce();
+        self.publish();
+    }
+
+    fn become_idle(&mut self) {
+        self.leader = self.me.id.clone();
+        self.upstream = None;
+        self.clock.set_leader();
+        self.clock_target.send_replace(None);
+        self.state = SharedState {
+            leader: self.me.id.clone(),
+            ..Default::default()
+        };
+    }
+
+    fn create(&mut self, name: String, policy: EditPolicy) {
+        self.become_idle();
+        let session = SessionInfo {
+            id: uuid::Uuid::new_v4().simple().to_string(),
+            name,
+            host: self.me.id.clone(),
+        };
+        self.me.session = Some(session.clone());
+        self.state.session = Some(session);
+        self.state.edit_policy = policy;
+        self.state.version = 1;
+        self.announce();
+        self.publish();
+    }
+
+    fn join(&mut self, session_id: &str) {
+        if self.session_id() == Some(session_id) {
+            return;
+        }
+        let Some(session) = self
+            .peers
+            .values()
+            .filter_map(|p| p.session.clone())
+            .find(|s| s.id == session_id)
+        else {
+            self.notice("No playlist with that name is on the network right now.");
+            return;
+        };
+        self.become_idle();
+        self.me.session = Some(session);
+        // Not yet following anyone: the election below picks the host.
+        self.leader = String::new();
+        self.state = SharedState::default();
+        self.announce();
+        self.elect();
+    }
+
+    /// Tell other nodes our details changed, over mDNS and open links.
+    fn announce(&mut self) {
+        self.advert.send_replace(self.me.clone());
+        let msg = Message::Announce {
+            info: self.me.clone(),
+        };
+        for c in self.conns.values().filter(|c| c.peer.is_some()) {
+            let _ = c.tx.send(msg.clone());
+        }
+    }
+
     fn on_tick(&mut self) {
+        if self.me.session.is_none() {
+            return;
+        }
         if self.is_leader() {
             self.broadcast_state();
         } else if let Some(up) = self.upstream {
             if self.last_from_leader.elapsed() > LEADER_TIMEOUT {
-                tracing::warn!("leader went quiet; dropping it");
+                tracing::warn!("host went quiet; dropping it");
                 self.drop_conn(up);
             }
         } else {
@@ -446,41 +632,51 @@ impl Actor {
             return;
         };
         let addr = c.addr;
+        let from = c.peer.clone();
         if Some(conn) == self.upstream {
             self.last_from_leader = Instant::now();
         }
         match msg {
-            Message::Hello { mut info, peers } => {
+            Message::Hello { info, peers } => {
                 if info.id == self.me.id {
                     // Dialled ourselves through a static peer address.
                     self.conns.remove(&conn);
                     return;
                 }
-                info.host = addr.ip().to_string();
                 if let Some(c) = self.conns.get_mut(&conn) {
                     c.peer = Some(info.id.clone());
                 }
-                self.peers.insert(info.id.clone(), info);
+                self.update_peer(info.clone(), addr);
                 for p in peers {
                     self.learn_peer(p);
                 }
                 self.elect();
-                if self.is_leader() {
+                if self.is_leader() && self.session_id().is_some_and(|s| info.in_session(s)) {
                     let msg = Message::State {
                         state: self.state.clone(),
                     };
                     self.send(conn, msg);
                 }
             }
+            Message::Announce { info } => {
+                if info.id != self.me.id {
+                    self.update_peer(info, addr);
+                    self.elect();
+                }
+            }
             Message::Request { command } => {
-                if self.is_leader() {
-                    self.apply(command);
+                let Some(from) = from else { return };
+                if self.is_leader() && self.me.session.is_some() {
+                    if let Err(e) = self.apply(command, &from) {
+                        self.send(conn, Message::Notice { text: e });
+                    }
                 } else {
                     self.send_upstream(Message::Request { command });
                 }
             }
             Message::State { state } => {
-                if self.is_leader() || state.leader != self.leader {
+                let ours = state.session.as_ref().map(|s| s.id.as_str()) == self.session_id();
+                if self.is_leader() || state.leader != self.leader || !ours {
                     return;
                 }
                 if state.version > self.state.version || self.state.leader != state.leader {
@@ -488,6 +684,13 @@ impl Actor {
                         self.learn_peer(p.clone());
                     }
                     self.state = state;
+                    // Keep our advertised host current so joiners find it.
+                    if let (Some(mine), Some(theirs)) = (&self.me.session, &self.state.session)
+                        && mine.host != theirs.host
+                    {
+                        self.me.session = Some(theirs.clone());
+                        self.announce();
+                    }
                     self.publish();
                 }
             }
@@ -496,31 +699,65 @@ impl Actor {
                     self.on_ended(&item_id);
                 }
             }
+            Message::Notice { text } => self.notice(text),
         }
     }
 
-    /// Adds a node someone else told us about, unless we already know better.
+    /// Record what a node told us about itself, with the address we see it at.
+    fn update_peer(&mut self, mut info: NodeInfo, addr: SocketAddr) {
+        info.host = addr.ip().to_string();
+        self.peers.insert(info.id.clone(), info);
+    }
+
+    /// Adds or refreshes a node someone else told us about.
     fn learn_peer(&mut self, p: NodeInfo) {
-        if p.id != self.me.id && !p.host.is_empty() && !self.peers.contains_key(&p.id) {
+        if p.id == self.me.id || p.host.is_empty() {
+            return;
+        }
+        // A direct link tells us more than hearsay, so don't overwrite it.
+        let linked = self
+            .conns
+            .values()
+            .any(|c| c.peer.as_deref() == Some(&p.id));
+        if !linked || !self.peers.contains_key(&p.id) {
             self.peers.insert(p.id.clone(), p);
         }
     }
 
-    /// Picks the most senior node as leader and reconnects if that changed.
-    fn elect(&mut self) {
-        let new = self
+    /// Who should host our session: the current host while it is still a
+    /// member, else the advertised host, else the longest-running member.
+    fn pick_host(&self) -> String {
+        let Some(session) = &self.me.session else {
+            return self.me.id.clone();
+        };
+        let members: Vec<&NodeInfo> = self
             .peers
             .values()
+            .filter(|p| p.in_session(&session.id))
             .chain(std::iter::once(&self.me))
+            .collect();
+        for preferred in [&self.leader, &session.host] {
+            if members.iter().any(|m| m.id == *preferred) {
+                return preferred.clone();
+            }
+        }
+        members
+            .into_iter()
             .min_by(|a, b| a.seniority().cmp(&b.seniority()))
             .map(|n| n.id.clone())
-            .unwrap();
+            .unwrap()
+    }
+
+    /// Re-checks who hosts our session and reconnects if that changed.
+    fn elect(&mut self) {
+        let new = self.pick_host();
         if new != self.leader {
             let old = std::mem::replace(&mut self.leader, new.clone());
-            tracing::info!("leader changed from {old} to {new}");
             if new == self.me.id {
-                self.take_over();
+                tracing::info!("this node now hosts the playlist");
+                self.take_over(&old);
             } else {
+                tracing::info!("following host {new}");
                 self.clock.set_follower();
                 self.upstream = None;
                 let target = self.peers.get(&new).and_then(|p| p.clock_addr());
@@ -528,16 +765,24 @@ impl Actor {
             }
         }
         self.ensure_upstream();
-        if self.is_leader() {
-            self.state.members = self.peers.values().cloned().collect();
+        if self.is_leader()
+            && let Some(sid) = self.session_id()
+        {
+            let sid = sid.to_string();
+            self.state.members = self
+                .peers
+                .values()
+                .filter(|p| p.in_session(&sid))
+                .cloned()
+                .collect();
             self.broadcast_state();
         }
         self.publish();
     }
 
-    /// Become leader, carrying on from the last state the old leader sent.
-    fn take_over(&mut self) {
-        if self.state.leader != self.me.id {
+    /// Become host, carrying on from the last state the old host sent.
+    fn take_over(&mut self, old: &str) {
+        if !old.is_empty() && self.state.leader != self.me.id {
             match self.clock.offset_us() {
                 // Shared time was local + offset; ours is now just local.
                 Some(offset) => self.state.timeline.rebase(-offset),
@@ -547,8 +792,13 @@ impl Actor {
         self.clock.set_leader();
         self.clock_target.send_replace(None);
         self.upstream = None;
+        if let Some(session) = &mut self.me.session {
+            session.host = self.me.id.clone();
+            self.state.session = Some(session.clone());
+        }
         self.state.leader = self.me.id.clone();
         self.state.version += 1;
+        self.announce();
     }
 
     fn ensure_upstream(&mut self) {
@@ -562,6 +812,11 @@ impl Actor {
         {
             self.upstream = Some(id);
             self.last_from_leader = Instant::now();
+            // The host only sends its state to members; tell it we joined.
+            let msg = Message::Announce {
+                info: self.me.clone(),
+            };
+            self.send(id, msg);
             return;
         }
         if let Some(addr) = self.peers.get(&self.leader).and_then(|p| p.control_addr()) {
@@ -673,11 +928,19 @@ impl Actor {
     }
 
     fn broadcast_state(&self) {
+        let Some(sid) = self.session_id() else { return };
         let msg = Message::State {
             state: self.state.clone(),
         };
-        for c in self.conns.values().filter(|c| c.peer.is_some()) {
-            let _ = c.tx.send(msg.clone());
+        for c in self.conns.values() {
+            let member = c
+                .peer
+                .as_ref()
+                .and_then(|p| self.peers.get(p))
+                .is_some_and(|p| p.in_session(sid));
+            if member {
+                let _ = c.tx.send(msg.clone());
+            }
         }
     }
 
@@ -697,12 +960,18 @@ impl Actor {
     fn on_ended(&mut self, item_id: &str) {
         let tl = &self.state.timeline;
         if tl.playing && tl.item_id.as_deref() == Some(item_id) {
-            self.apply(Command::Next);
+            let me = self.me.id.clone();
+            let _ = self.apply(Command::Next, &me);
         }
     }
 
-    /// Leader only: change the shared state and tell everyone.
-    fn apply(&mut self, command: Command) {
+    /// Host only: change the shared state for a command sent by node
+    /// `origin`, and tell every member. Returns why a command was refused.
+    fn apply(&mut self, command: Command, origin: &str) -> Result<(), String> {
+        let is_host = origin == self.me.id;
+        if command.edits_playlist() && self.state.edit_policy == EditPolicy::HostOnly && !is_host {
+            return Err("Only the host can change this playlist.".into());
+        }
         let now = self.clock.local().now_us();
         let start = now + self.start_delay_us;
         let current = self.state.timeline.item_id.clone();
@@ -754,9 +1023,16 @@ impl Actor {
                 }
             }
             Command::Stop => timeline.stop(),
+            Command::SetEditPolicy { policy } => {
+                if !is_host {
+                    return Err("Only the host can change who may edit.".into());
+                }
+                self.state.edit_policy = policy;
+            }
         }
         self.state.version += 1;
         self.broadcast_state();
         self.publish();
+        Ok(())
     }
 }

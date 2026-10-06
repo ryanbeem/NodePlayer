@@ -20,21 +20,42 @@ speakers) is in the
 cargo run --release
 ```
 
-Do the same on another PC on the same network. Within a few seconds each one
-lists the other under `peers`. Then, on either PC:
+Do the same on another PC on the same network. Each PC starts out idle.
+Create a playlist on one of them:
+
+```
+> create Movie Night
+```
+
+Add `host-only` at the end (`create Movie Night host-only`) if only this PC
+should be able to change the playlist. Members can still play, pause, seek
+and skip either way, and the host can switch later with `edits all` or
+`edits host`.
+
+On the other PC, list the playlists on the network and join one:
+
+```
+> sessions
+   1. Movie Night  (host pc-a, 1 PC)
+> join 1
+```
+
+Then, on any PC in the playlist (or only the host, for host-only):
 
 ```
 > add /path/to/movie.mp4
 > play
 ```
 
-Both PCs open an mpv window and play the movie together. A file added on one
-PC is streamed from that PC to the others, so it does not need to be copied
-first. URLs (`http://…`) and network share paths work too.
+Every PC in the playlist opens an mpv window and plays the movie together.
+A file added on one PC is streamed from that PC to the others, so it does
+not need to be copied first. URLs (`http://…`) and network share paths work
+too. Several playlists can run on the same network at once.
 
-Commands: `add`, `list`, `play [n]`, `pause`, `resume`, `seek <seconds>`,
-`next`, `prev`, `remove <n>`, `move <n> <m>`, `stop`, `peers`, `status`,
-`quit`. Type `help` for details.
+Commands: `sessions`, `create`, `join`, `leave`, `edits`, `add`, `list`,
+`play [n]`, `pause`, `resume`, `seek <seconds>`, `next`, `prev`,
+`remove <n>`, `move <n> <m>`, `stop`, `peers`, `status`, `quit`. Type `help`
+for details.
 
 Useful options:
 
@@ -51,11 +72,14 @@ Set `RUST_LOG=nodeplayer=debug` to see each node's measured sync error.
 
 ## How it works
 
-- **Discovery.** Each node advertises `_nodeplayer._tcp` over mDNS.
-- **Leader.** The node that has been running longest leads. It holds the
-  playlist and the playback timeline; other nodes send it requests over a TCP
-  link (one JSON message per line) and mirror the state it broadcasts. If the
-  leader quits, the next oldest node takes over from its copy of the state.
+- **Discovery.** Each node advertises `_nodeplayer._tcp` over mDNS,
+  including the playlist it is in, so `sessions` can list every playlist.
+- **Host.** The PC that creates a playlist hosts it. It holds the playlist
+  and the playback timeline; members send it requests over a TCP link (one
+  JSON message per line) and mirror the state it broadcasts. The host
+  enforces the host-only setting. If the host quits or leaves, the
+  longest-running remaining member takes over from its copy of the state,
+  and for a host-only playlist it becomes the one PC allowed to edit.
 - **Clock.** Followers measure the offset to the leader's clock with an
   NTP-style UDP exchange twice a second, trusting the sample with the lowest
   round trip.
@@ -85,6 +109,7 @@ files with range requests, and hand over leadership when the leader leaves.
 ## Known limits
 
 - Command-line interface only; a desktop UI comes next.
+- Dropping a file onto the mpv window plays it on that PC only; use `add`.
 - No pairing or encryption yet: any NodePlayer on the network can join.
 - Sync depends on mpv reporting output latency correctly. Bluetooth speakers
   usually need `--offset-ms`.

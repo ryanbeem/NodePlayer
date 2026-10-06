@@ -4,7 +4,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use nodeplayer::node::{Config, Node, View};
-use nodeplayer::protocol::Command;
+use nodeplayer::protocol::{Command, EditPolicy};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -47,6 +47,27 @@ async fn wait_for(node: &Node, what: &str, pred: impl Fn(&View) -> bool) -> View
     }
 }
 
+/// `host` creates a playlist and every node in `members` joins it.
+async fn session(host: &Node, policy: EditPolicy, members: &[&Node]) {
+    host.create("movie night", policy);
+    let v = wait_for(host, "session", |v| v.session().is_some()).await;
+    let id = v.session().unwrap().id.clone();
+    for m in members {
+        wait_for(m, "the session", |v| {
+            v.sessions().iter().any(|s| s.id == id)
+        })
+        .await;
+        m.join(&id);
+        wait_for(m, "host link", |v| v.leader == host.info.id && v.connected).await;
+        wait_for(host, "member", |v| {
+            v.peers
+                .iter()
+                .any(|p| p.id == m.info.id && p.in_session(&id))
+        })
+        .await;
+    }
+}
+
 async fn wait_synced(node: &Node) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !node.clock.is_synced() {
@@ -64,7 +85,7 @@ async fn nodes_share_playlist_clock_and_timeline() {
     let a = start("a", 1000, vec![]).await;
     let b = start("b", 2000, vec![control_addr(&a)]).await;
 
-    wait_for(&b, "a as leader", |v| v.leader == a.info.id && v.connected).await;
+    session(&a, EditPolicy::Anyone, &[&b]).await;
     wait_synced(&b).await;
 
     // Clocks agree to within a couple of milliseconds over loopback.
@@ -113,7 +134,7 @@ async fn nodes_share_playlist_clock_and_timeline() {
 async fn shared_files_stream_with_range_requests() {
     let a = start("a", 1000, vec![]).await;
     let b = start("b", 2000, vec![control_addr(&a)]).await;
-    wait_for(&b, "a as leader", |v| v.leader == a.info.id && v.connected).await;
+    session(&a, EditPolicy::Anyone, &[&b]).await;
 
     let dir = std::env::temp_dir().join(format!("nodeplayer-test-{}", b.info.id));
     std::fs::create_dir_all(&dir).unwrap();
@@ -144,8 +165,7 @@ async fn next_oldest_node_takes_over_when_leader_leaves() {
     let b = start("b", 2000, vec![control_addr(&a)]).await;
     // c only knows a; it learns about b from a.
     let c = start("c", 3000, vec![control_addr(&a)]).await;
-    wait_for(&b, "a as leader", |v| v.leader == a.info.id && v.connected).await;
-    wait_for(&c, "a as leader", |v| v.leader == a.info.id && v.connected).await;
+    session(&a, EditPolicy::Anyone, &[&b, &c]).await;
     wait_synced(&b).await;
 
     a.add("http://example.com/movie.mp4").unwrap();
@@ -181,4 +201,75 @@ async fn next_oldest_node_takes_over_when_leader_leaves() {
     );
     let vc = wait_for(&c, "b's state", |v| v.state.version >= vb.state.version).await;
     assert_eq!(vc.state.playlist, vb.state.playlist);
+}
+
+#[tokio::test]
+async fn idle_nodes_ignore_a_session_until_they_join() {
+    let a = start("a", 1000, vec![]).await;
+    let b = start("b", 2000, vec![control_addr(&a)]).await;
+    a.create("party", EditPolicy::Anyone);
+    let vb = wait_for(&b, "the session", |v| v.sessions().len() == 1).await;
+    assert_eq!(vb.sessions()[0].name, "party");
+    assert_eq!(vb.sessions()[0].host_name, "a");
+
+    a.add("http://example.com/song.mp3").unwrap();
+    a.command(Command::Play { item_id: None });
+    wait_for(&a, "playing", |v| v.state.timeline.playing).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let vb = b.view().borrow().clone();
+    assert!(vb.session().is_none());
+    assert!(vb.state.playlist.items.is_empty());
+    assert!(!vb.state.timeline.playing);
+
+    // Joining picks up the playlist already playing; leaving drops it.
+    b.join(&vb.sessions()[0].id);
+    wait_for(&b, "playing", |v| {
+        v.state.timeline.playing && v.state.playlist.items.len() == 1
+    })
+    .await;
+    b.leave();
+    let vb = wait_for(&b, "idle", |v| v.session().is_none()).await;
+    assert!(!vb.state.timeline.playing);
+    wait_for(&a, "b gone from the session", |v| {
+        v.sessions()[0].members == 1
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn host_only_playlists_refuse_edits_from_members() {
+    let a = start("a", 1000, vec![]).await;
+    let b = start("b", 2000, vec![control_addr(&a)]).await;
+    session(&a, EditPolicy::HostOnly, &[&b]).await;
+    let mut notices = b.notices();
+
+    // b's own check refuses straight away.
+    wait_for(&b, "the policy", |v| {
+        v.state.edit_policy == EditPolicy::HostOnly
+    })
+    .await;
+    b.add("http://example.com/b.mp4").unwrap();
+    let text = tokio::time::timeout(Duration::from_secs(5), notices.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(text.contains("Only the host"), "{text}");
+
+    // The host can edit, and members can still control playback.
+    a.add("http://example.com/a.mp4").unwrap();
+    wait_for(&b, "a's item", |v| v.state.playlist.items.len() == 1).await;
+    b.command(Command::Play { item_id: None });
+    wait_for(&a, "playing", |v| v.state.timeline.playing).await;
+    assert_eq!(a.view().borrow().state.playlist.items.len(), 1);
+
+    // Opening the playlist up lets b add.
+    a.command(Command::SetEditPolicy {
+        policy: EditPolicy::Anyone,
+    });
+    wait_for(&b, "open policy", |v| {
+        v.state.edit_policy == EditPolicy::Anyone
+    })
+    .await;
+    b.add("http://example.com/b.mp4").unwrap();
+    wait_for(&a, "b's item", |v| v.state.playlist.items.len() == 2).await;
 }
