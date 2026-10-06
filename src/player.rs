@@ -300,6 +300,7 @@ pub struct Player {
     user_seeking: bool,
     user_loading: bool,
     hold_until: Option<std::time::Instant>,
+    duration: watch::Sender<Option<f64>>,
 }
 
 impl Player {
@@ -311,6 +312,9 @@ impl Player {
     ) -> anyhow::Result<Player> {
         let mpv = Mpv::spawn(cfg).await?;
         mpv.command(json!(["observe_property", 1, "pause"]))
+            .await
+            .ok();
+        mpv.command(json!(["observe_property", 2, "duration"]))
             .await
             .ok();
         Ok(Player {
@@ -334,7 +338,13 @@ impl Player {
             user_seeking: false,
             user_loading: false,
             hold_until: None,
+            duration: watch::channel(None).0,
         })
+    }
+
+    /// Length in seconds of what mpv has loaded, when known.
+    pub fn duration(&self) -> watch::Receiver<Option<f64>> {
+        self.duration.subscribe()
     }
 
     /// Runs until mpv exits, reporting what happens through `on_event`.
@@ -410,6 +420,12 @@ impl Player {
                     };
                     on_event(PlayerEvent::Command(command));
                 }
+            }
+            Some("property-change")
+                if event.get("name").and_then(Value::as_str) == Some("duration") =>
+            {
+                let duration = event.get("data").and_then(Value::as_f64);
+                self.duration.send_replace(duration);
             }
             Some("seek") => {
                 if self.our_seeks > 0 {

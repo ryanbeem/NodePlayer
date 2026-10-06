@@ -17,47 +17,39 @@ speakers) is in the
 ## Run it
 
 ```sh
-cargo run --release
+cargo build --release
+./target/release/nodeplayer        # nodeplayer.exe on Windows
 ```
 
-Do the same on another PC on the same network. Each PC starts out idle.
-Create a playlist on one of them:
+This opens the NodePlayer window. Do the same on another PC on the same
+network. Each PC starts out idle.
 
-```
-> create Movie Night
-```
-
-Add `host-only` at the end (`create Movie Night host-only`) if only this PC
-should be able to change the playlist. Members can still play, pause, seek
-and skip either way, and the host can switch later with `edits all` or
-`edits host`.
-
-On the other PC, list the playlists on the network and join one:
-
-```
-> sessions
-   1. Movie Night  (host pc-a, 1 PC)
-> join 1
-```
-
-Then, on any PC in the playlist (or only the host, for host-only):
-
-```
-> add /path/to/movie.mp4      (or a folder, to add everything in it)
-> play
-```
+1. On one PC, type a name under **Start a playlist** and click **Create**.
+   Tick **Only this PC can change it** if only this PC should be able to edit
+   the playlist. Members can still play, pause, seek and skip either way, and
+   the host can change this setting later.
+2. On the other PC, the playlist appears under **Playlists on the network**.
+   Click **Join**.
+3. On any PC in the playlist (or only the host, for host-only), click
+   **Add files…** or **Add folder…**, paste a URL, or drag files onto the
+   window. Then click **Play**, or the ▶ next to an item.
 
 Every PC in the playlist opens an mpv window and plays the movie together.
-Pausing, seeking or dropping a file in any mpv window does the same on every
+The bottom bar has play/pause, previous, next, stop and a seek bar, and
+pausing, seeking or dropping a file in any mpv window does the same on every
 PC in the playlist.
 A file added on one PC is streamed from that PC to the others, so it does
 not need to be copied first. URLs (`http://…`) and network share paths work
 too. Several playlists can run on the same network at once.
 
-Commands: `sessions`, `create`, `join`, `leave`, `edits`, `add`, `list`,
-`play [n]`, `pause`, `resume`, `seek <seconds>`, `next`, `prev`,
-`remove <n>`, `move <n> <m>`, `stop`, `peers`, `status`, `quit`. Type `help`
-for details.
+### Terminal version
+
+`./target/release/nodeplayer-cli` does the same from a terminal. Commands:
+`sessions`, `create <name> [host-only]`, `join <n>`, `leave`,
+`edits all|host`, `add <file|folder|URL>`, `list`, `play [n]`, `pause`,
+`resume`, `seek <seconds>`, `next`, `prev`, `remove <n>`, `move <n> <m>`,
+`stop`, `peers`, `status`, `quit`. Type `help` for details. Both versions
+take the options below and can be in the same playlist.
 
 Useful options:
 
@@ -96,7 +88,8 @@ Set `RUST_LOG=nodeplayer=debug` to see each node's measured sync error.
 Code map: `src/clock.rs`, `src/timeline.rs`, `src/playlist.rs`,
 `src/protocol.rs`, `src/node.rs` (networking and leader election),
 `src/discovery.rs`, `src/media.rs` (file sharing over HTTP),
-`src/player.rs` (mpv), `src/main.rs` (command line).
+`src/player.rs` (mpv), `src/main.rs` (desktop window, egui),
+`src/bin/nodeplayer-cli.rs` (terminal version).
 
 ## Tests
 
@@ -110,7 +103,6 @@ files with range requests, and hand over leadership when the leader leaves.
 
 ## Known limits
 
-- Command-line interface only; a desktop UI comes next.
 - No pairing or encryption yet: any NodePlayer on the network can join.
 - Sync depends on mpv reporting output latency correctly. Bluetooth speakers
   usually need `--offset-ms`.

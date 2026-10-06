@@ -12,3 +12,4 @@ pub mod player;
 pub mod playlist;
 pub mod protocol;
 pub mod timeline;
+pub mod util;
