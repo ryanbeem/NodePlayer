@@ -43,7 +43,7 @@ On the other PC, list the playlists on the network and join one:
 Then, on any PC in the playlist (or only the host, for host-only):
 
 ```
-> add /path/to/movie.mp4
+> add /path/to/movie.mp4      (or a folder, to add everything in it)
 > play
 ```
 
@@ -109,7 +109,8 @@ files with range requests, and hand over leadership when the leader leaves.
 ## Known limits
 
 - Command-line interface only; a desktop UI comes next.
-- Dropping a file onto the mpv window plays it on that PC only; use `add`.
+- Dropping a file onto the mpv window plays it on that PC only; use `add`
+  (it takes a file, a folder or a URL).
 - No pairing or encryption yet: any NodePlayer on the network can join.
 - Sync depends on mpv reporting output latency correctly. Bluetooth speakers
   usually need `--offset-ms`.

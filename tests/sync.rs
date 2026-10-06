@@ -273,3 +273,36 @@ async fn host_only_playlists_refuse_edits_from_members() {
     b.add("http://example.com/b.mp4").unwrap();
     wait_for(&a, "b's item", |v| v.state.playlist.items.len() == 2).await;
 }
+
+#[tokio::test]
+async fn adding_a_folder_adds_its_media_in_order() {
+    let a = start("a", 1000, vec![]).await;
+    a.create("folder", EditPolicy::Anyone);
+    wait_for(&a, "session", |v| v.session().is_some()).await;
+
+    let dir = std::env::temp_dir().join(format!("nodeplayer-folder-{}", a.info.id));
+    std::fs::create_dir_all(dir.join("disc 2")).unwrap();
+    for name in [
+        "02 b.mp3",
+        "01 a.MP3",
+        "notes.txt",
+        ".hidden.mp3",
+        "disc 2/03 c.mkv",
+    ] {
+        std::fs::write(dir.join(name), b"x").unwrap();
+    }
+    let items = a.add_folder(dir.to_str().unwrap()).unwrap();
+    let titles: Vec<_> = items.iter().map(|i| i.title.as_str()).collect();
+    assert_eq!(titles, ["01 a.MP3", "02 b.mp3", "03 c.mkv"]);
+
+    let v = wait_for(&a, "three items", |v| v.state.playlist.items.len() == 3).await;
+    let order: Vec<_> = v
+        .state
+        .playlist
+        .items
+        .iter()
+        .map(|i| i.title.as_str())
+        .collect();
+    assert_eq!(order, titles);
+    std::fs::remove_dir_all(dir).ok();
+}

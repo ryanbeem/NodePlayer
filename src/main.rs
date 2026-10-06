@@ -49,7 +49,9 @@ playlists:
   leave               leave the playlist
   edits all|host      host only: who may change the playlist
 playback (in a playlist):
-  add <file or URL>   add to the shared playlist
+  add <file, folder or URL>
+                      add to the shared playlist (a folder adds all its
+                      audio and video files, subfolders included)
   list                show the playlist
   play [n]            play item n (1-based), or resume / start
   pause | resume      pause or resume everywhere
@@ -224,8 +226,15 @@ fn run_command(node: &Node, view: &View, line: &str) -> anyhow::Result<bool> {
         }
         "add" => {
             anyhow::ensure!(view.session().is_some(), "join or create a playlist first");
-            let item = node.add(rest)?;
-            println!("added {}", item.title);
+            // Paths dragged into a terminal often arrive quoted.
+            let path = rest.trim_matches(|c| c == '\'' || c == '"');
+            if std::path::Path::new(path).is_dir() {
+                let items = node.add_folder(path)?;
+                println!("added {} files from {path}", items.len());
+            } else {
+                let item = node.add(path)?;
+                println!("added {}", item.title);
+            }
         }
         "list" | "ls" => {
             if view.state.playlist.items.is_empty() {

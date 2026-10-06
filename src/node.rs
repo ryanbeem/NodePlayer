@@ -353,6 +353,19 @@ impl Node {
         let _ = self.events.send(Event::Leave);
     }
 
+    /// Adds every media file in `dir` and its subfolders, in name order.
+    /// Returns the items added, or an error if none were found.
+    pub fn add_folder(&self, dir: &str) -> anyhow::Result<Vec<Item>> {
+        let mut files = Vec::new();
+        collect_media(Path::new(dir), &mut files)?;
+        files.sort();
+        anyhow::ensure!(!files.is_empty(), "no audio or video files found in {dir}");
+        files
+            .iter()
+            .map(|f| self.add(&f.to_string_lossy()))
+            .collect()
+    }
+
     /// Adds a local file (shared from this node) or a URL to the playlist.
     pub fn add(&self, input: &str) -> anyhow::Result<Item> {
         let path = Path::new(input);
@@ -403,6 +416,32 @@ impl Node {
             let _ = events.send(Event::Ended(item_id));
         }
     }
+}
+
+/// File extensions `add_folder` picks up.
+const MEDIA_EXTENSIONS: &[&str] = &[
+    "mp4", "m4v", "mkv", "webm", "mov", "avi", "wmv", "flv", "mpg", "mpeg", "ts", "m2ts", "mp3",
+    "flac", "wav", "ogg", "oga", "opus", "m4a", "aac", "wma", "aiff",
+];
+
+fn collect_media(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> anyhow::Result<()> {
+    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+        let path = entry?.path();
+        let hidden = path
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with('.'));
+        if hidden {
+            continue;
+        }
+        if path.is_dir() {
+            collect_media(&path, out)?;
+        } else if path.extension().is_some_and(|e| {
+            MEDIA_EXTENSIONS.contains(&e.to_string_lossy().to_lowercase().as_str())
+        }) {
+            out.push(path);
+        }
+    }
+    Ok(())
 }
 
 impl Drop for Node {
